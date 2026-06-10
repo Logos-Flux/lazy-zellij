@@ -1,0 +1,8 @@
+# lzj runtime state — never committed
+*.bak
+*.bak-*
+
+# editor/OS cruft
+.DS_Store
+*.swp
+*~

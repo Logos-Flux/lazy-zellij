@@ -1,0 +1,7 @@
+[Unit]
+Description=Snapshot active zellij sessions for the lzj preview pane
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lzj-snapshot
+Nice=10

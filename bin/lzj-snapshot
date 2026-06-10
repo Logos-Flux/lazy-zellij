@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# lzj-snapshot — capture screen contents for each active zellij session.
+# Runs periodically (via lzj-snapshot.timer) so the lzj preview can show
+# what each session is working on, even after the user detaches.
+#
+# dump-screen only produces output when a client is attached, so we snapshot
+# opportunistically: sessions with no current client keep their previous
+# snapshot (which is what we want — last-seen state).
+
+set -euo pipefail
+
+ZELLIJ=${ZELLIJ_BIN:-$(command -v zellij 2>/dev/null || echo zellij)}
+SNAP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lzj/snapshots"
+mkdir -p "$SNAP_DIR"
+
+strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+"$ZELLIJ" list-sessions 2>/dev/null | strip_ansi | awk '!/EXITED/ {print $1}' | \
+while IFS= read -r name; do
+    [ -z "$name" ] && continue
+
+    # Skip if there's no attached client (dump-screen would no-op anyway)
+    client_count=$("$ZELLIJ" --session "$name" action list-clients 2>/dev/null | tail -n +2 | grep -c . || true)
+    [ "$client_count" -eq 0 ] && continue
+
+    tmp=$(mktemp "$SNAP_DIR/.${name}.XXXXXX") || continue
+    if "$ZELLIJ" --session "$name" action dump-screen "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        mv -f "$tmp" "$SNAP_DIR/${name}.txt"
+    else
+        rm -f "$tmp"
+    fi
+done
+
+# Garbage-collect snapshots for sessions that no longer exist
+if [ -d "$SNAP_DIR" ]; then
+    live_names=$("$ZELLIJ" list-sessions 2>/dev/null | strip_ansi | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
+    [ -z "$live_names" ] && exit 0
+    find "$SNAP_DIR" -maxdepth 1 -name '*.txt' -printf '%f\n' | while IFS= read -r f; do
+        n=${f%.txt}
+        if ! grep -qxE "$live_names" <<<"$n"; then
+            rm -f "$SNAP_DIR/$f"
+        fi
+    done
+fi

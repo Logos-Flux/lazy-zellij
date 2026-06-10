@@ -1,0 +1,22 @@
+[Unit]
+Description=Zellij session %i
+Documentation=https://zellij.dev
+After=default.target
+
+[Service]
+# `attach -b` creates a detached background session and exits. The zellij
+# server runs independently, so we use oneshot + RemainAfterExit to track it.
+# The ExecStart is idempotent: it only creates the session if it doesn't
+# already exist, so `systemctl --user start zellij@foo` is safe to call even
+# when "foo" was already created by hand via lzj/zj.
+#
+# @ZELLIJ_BIN@ is replaced with your zellij path by install.sh. If you install
+# the units by hand, substitute it yourself (e.g. /usr/local/bin/zellij or
+# /snap/bin/zellij — run `command -v zellij` to find it).
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '@ZELLIJ_BIN@ list-sessions --short 2>/dev/null | grep -qx "%i" || @ZELLIJ_BIN@ attach -b "%i"'
+ExecStop=@ZELLIJ_BIN@ kill-session %i
+
+[Install]
+WantedBy=default.target

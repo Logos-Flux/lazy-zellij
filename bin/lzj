@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# lzj — "lazy zellij" fzf-based session manager
+#
+# Run with no args for the interactive picker.
+# Internal flags (used by fzf itself) start with `--_`.
+
+set -euo pipefail
+
+ZELLIJ=${ZELLIJ_BIN:-$(command -v zellij 2>/dev/null || echo zellij)}
+SELF=$(readlink -f "$0")
+
+# Resolve a remote-target shortcut to a real ssh hostname.
+#
+# `lzj @<host>` passes <host> to ssh verbatim, so any name from your
+# ~/.ssh/config already works (e.g. `lzj @myserver`). Add short aliases here
+# if you like — examples below, edit to taste. Sourcing ~/.config/lzj/hosts
+# lets you keep machine-specific shortcuts out of version control.
+[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/lzj/hosts" ] && \
+    . "${XDG_CONFIG_HOME:-$HOME/.config}/lzj/hosts"
+resolve_host() {
+    # If a resolve_host_user override is defined (e.g. from the hosts file
+    # above), let it have first crack at the name.
+    if declare -F resolve_host_user >/dev/null; then
+        local mapped; mapped=$(resolve_host_user "$1")
+        [ -n "$mapped" ] && { echo "$mapped"; return; }
+    fi
+    case "$1" in
+        # Example: map a short alias to a full ssh host. Uncomment + edit, or
+        # define resolve_host_user in ~/.config/lzj/hosts instead.
+        # srv|s) echo my-server.example.com ;;
+        *) echo "$1" ;;
+    esac
+}
+SNAP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/lzj/snapshots"
+LAYOUT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/zellij/layouts"
+BUILTIN_LAYOUTS=(default compact strider disable-status-bar)
+
+# Emit TSV rows for the layout picker: kind \t ref \t display
+# kind: builtin | custom
+# ref:  builtin name (e.g. "compact") or absolute path to a .kdl file
+list_layouts() {
+    local reset=$'\e[0m'
+    for n in "${BUILTIN_LAYOUTS[@]}"; do
+        printf 'builtin\t%s\t%b%-8s%b %s\n' "$n" $'\e[36m' "[builtin]" "$reset" "$n"
+    done
+    if [ -d "$LAYOUT_DIR" ]; then
+        while IFS= read -r -d '' f; do
+            local stem=${f##*/}; stem=${stem%.kdl}
+            printf 'custom\t%s\t%b%-8s%b %s  %b(%s)%b\n' \
+                "$f" $'\e[35m' "[custom]" "$reset" "$stem" $'\e[2m' "$f" "$reset"
+        done < <(find "$LAYOUT_DIR" -maxdepth 1 -type f -name '*.kdl' -print0 2>/dev/null | sort -z)
+    fi
+}
+
+# Apply a layout to a session. If the session is running, open a new tab using
+# the layout; otherwise (missing/exited/systemd) create a fresh session with it
+# and attach.
+#
+# $1 = session name, $2 = layout ref (builtin name or absolute path)
+apply_layout() {
+    local name=$1 ref=$2
+    local running=0
+    if "$ZELLIJ" list-sessions -s 2>/dev/null | grep -Fxq "$name"; then
+        running=1
+    fi
+
+    # Are we already inside a zellij client? If so, `zellij attach` will refuse
+    # to nest and drop us onto the new-session-name wizard (which appears stuck
+    # because fzf's `become` has already replaced our shell's stdin handling).
+    local inside_zellij=0 current_session=""
+    if [ -n "${ZELLIJ:-}" ]; then
+        inside_zellij=1
+        current_session=${ZELLIJ_SESSION_NAME:-}
+    fi
+
+    if [ "$running" = 1 ]; then
+        # new-tab --layout needs a real path; built-ins won't resolve here.
+        if [ -f "$ref" ]; then
+            "$ZELLIJ" --session "$name" action new-tab --layout "$ref"
+        else
+            echo "lzj: session '$name' is running; built-in layout '$ref' cannot be applied as a new tab (zellij requires a layout file path here)." >&2
+            echo "      Use a custom layout from $LAYOUT_DIR, or kill the session first to recreate it with this layout." >&2
+            sleep 2
+        fi
+
+        if [ "$inside_zellij" = 1 ]; then
+            # Already inside zellij. If it's the target session, the new tab is
+            # already visible — just exit. Otherwise switch clients.
+            if [ "$current_session" = "$name" ]; then
+                exit 0
+            fi
+            exec "$ZELLIJ" action switch-session "$name"
+        fi
+        exec "$ZELLIJ" attach "$name"
+    else
+        # Fresh create. zellij accepts a built-in name or a path for --layout.
+        if [ "$inside_zellij" = 1 ]; then
+            echo "lzj: cannot create session '$name' from inside zellij (currently in '$current_session')." >&2
+            echo "      Detach first (Ctrl-o d) and rerun, or use a different session name." >&2
+            sleep 3
+            exit 1
+        fi
+        exec "$ZELLIJ" --session "$name" --layout "$ref"
+    fi
+}
+
+# Interactive layout picker. $1 = session name.
+pick_layout_for() {
+    local name=$1
+    local sel
+    sel=$(
+        list_layouts | \
+        fzf \
+            --ansi \
+            --delimiter=$'\t' \
+            --with-nth=3 \
+            --header="layout for session: $name  (enter:apply  esc:cancel)" \
+            --header-first \
+            --prompt='layout › ' \
+        || true
+    )
+    [ -z "$sel" ] && return 0
+    local ref
+    ref=$(printf '%s' "$sel" | cut -f2)
+    [ -z "$ref" ] && return 0
+    apply_layout "$name" "$ref"
+}
+
+# Render an age in seconds as "5s" / "2m" / "1h 14m"
+fmt_age() {
+    local s=$1
+    if   [ "$s" -lt 60 ];    then printf '%ds' "$s"
+    elif [ "$s" -lt 3600 ];  then printf '%dm' "$((s/60))"
+    elif [ "$s" -lt 86400 ]; then printf '%dh %dm' "$((s/3600))" "$(((s%3600)/60))"
+    else                          printf '%dd' "$((s/86400))"
+    fi
+}
+
+strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+# True if NAME is a sane single-token session name. lzj's whole model assumes
+# names are tokenizable, so we reject anything with whitespace (space/tab/
+# newline) or non-printable chars. This is the guard that stops corrupt names —
+# e.g. echoed messages like "created detached session: voice" or
+# "Session: ... deleted." — from ever being created as real sessions.
+valid_session_name() {
+    local n=$1
+    [ -n "$n" ] || return 1
+    case "$n" in
+        *[$' \t\n']*) return 1 ;;
+    esac
+    [ "$n" = "$(printf '%s' "$n" | tr -cd '[:print:]')" ] || return 1
+    return 0
+}
+
+# Parse `zellij action dump-layout` output into a tab/pane tree.
+# Skips plugin panes (tab-bar/status-bar) and stops at template blocks.
+layout_tree() {
+    # Reads dump-layout output on stdin; emits a tab/pane tree.
+    # Uses python3 -c (not a heredoc) so stdin remains the pipe.
+    python3 -c '
+import sys, re
+text = sys.stdin.read()
+for marker in ("new_tab_template", "swap_tiled_layout"):
+    i = text.find(marker)
+    if i != -1:
+        text = text[:i]
+lines = text.splitlines()
+n = len(lines)
+out = []
+for idx, line in enumerate(lines):
+    m = re.search(r"tab name=\"([^\"]+)\"", line)
+    if m:
+        out.append("  ▸ tab: " + m.group(1))
+        continue
+    m = re.search(r"pane\b[^{]*command=\"([^\"]+)\"", line)
+    if m:
+        cmd = m.group(1)
+        args = ""
+        for j in range(idx + 1, min(idx + 8, n)):
+            am = re.search(r"args\s+\"([^\"]+)\"", lines[j])
+            if am:
+                args = am.group(1); break
+            if re.match(r"\s*pane\b", lines[j]) or re.match(r"\s*tab\b", lines[j]):
+                break
+            if re.match(r"\s*}\s*$", lines[j]):
+                break
+        out.append(("        • " + (cmd + " " + args)).rstrip())
+print("\n".join(out) if out else "  (no tabs/panes — session may be empty)")
+'
+}
+
+# ── data source ────────────────────────────────────────────────────────────────
+# Emits TSV rows: kind \t name \t status \t display
+# kind: current | running | exited | systemd
+list_rows() {
+    local seen=" " name status kind disp color reset=$'\e[0m'
+
+    # 1. zellij-known sessions (active + resurrectable)
+    while IFS= read -r raw; do
+        [ -z "$raw" ] && continue
+        local clean
+        clean=$(printf '%s' "$raw" | strip_ansi)
+        # A real session row looks like:  NAME [Created Xs ago] (EXITED...)
+        # Skip any line without the "[Created" marker — those are continuation
+        # lines from a corrupt session name containing a newline, not real rows.
+        case "$clean" in
+            *"[Created"*) : ;;
+            *) continue ;;
+        esac
+        # Take everything before " [Created" as the name (handles names with
+        # spaces correctly instead of truncating to the first token).
+        name=${clean%% \[Created*}
+        name=${name%"${name##*[![:space:]]}"}   # rstrip trailing whitespace
+        local rest=${clean#"$name"}; rest=${rest# }
+        seen+="$name "
+        if [[ "$rest" == *"(current)"* ]]; then
+            kind=current; color=$'\e[1;32m'
+        elif [[ "$rest" == *EXITED* ]]; then
+            kind=exited;  color=$'\e[33m'
+        else
+            kind=running; color=$'\e[32m'
+        fi
+        status=$rest
+        disp=$(printf '%b%-8s%b %-22s %s' "$color" "[$kind]" "$reset" "$name" "$status")
+        printf '%s\t%s\t%s\t%s\n' "$kind" "$name" "$status" "$disp"
+    done < <("$ZELLIJ" list-sessions 2>/dev/null || true)
+
+    # 2. systemd-managed units that don't correspond to a live/exited session
+    while IFS= read -r unit; do
+        [ -z "$unit" ] && continue
+        name=${unit#zellij@}; name=${name%.service}
+        case " $seen " in *" $name "*) continue ;; esac
+        local enabled active
+        enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || echo unknown)
+        active=$(systemctl --user is-active "$unit" 2>/dev/null || echo inactive)
+        status="systemd: $enabled, $active"
+        color=$'\e[36m'
+        disp=$(printf '%b%-8s%b %-22s %s' "$color" "[systemd]" "$reset" "$name" "$status")
+        printf 'systemd\t%s\t%s\t%s\n' "$name" "$status" "$disp"
+    done < <(systemctl --user list-unit-files 'zellij@*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+}
+
+# ── preview pane ───────────────────────────────────────────────────────────────
+preview_row() {
+    local line=$1
+    local kind name status
+    kind=$(printf '%s' "$line" | cut -f1)
+    name=$(printf '%s' "$line" | cut -f2)
+    status=$(printf '%s' "$line" | cut -f3)
+
+    printf '\e[1mname\e[0m    %s\n' "$name"
+    printf '\e[1mkind\e[0m    %s\n' "$kind"
+    printf '\e[1mstatus\e[0m  %s\n' "$status"
+    echo
+
+    local unit="zellij@${name}.service"
+    if systemctl --user list-unit-files "$unit" --no-legend --no-pager 2>/dev/null | grep -q .; then
+        echo "── systemd ($unit) ──"
+        systemctl --user status "$unit" --no-pager 2>&1 | head -10 | sed 's/^/  /'
+    else
+        echo "── systemd ──"
+        echo "  (no unit registered — use ctrl-u to create one)"
+    fi
+    echo
+
+    echo "── session details ──"
+    case "$kind" in
+        running|current)
+            "$ZELLIJ" list-sessions 2>/dev/null | strip_ansi | awk -v n="$name" '$1==n{print "  "$0}' || true
+            echo
+            echo "── tabs & panes ──"
+            "$ZELLIJ" --session "$name" action dump-layout 2>/dev/null | layout_tree
+            echo
+            echo "── clients attached ──"
+            local clients
+            clients=$("$ZELLIJ" --session "$name" action list-clients 2>/dev/null | tail -n +2)
+            if [ -z "$clients" ]; then
+                echo "  (none — session is detached)"
+            else
+                printf '%s\n' "$clients" | awk '{printf "  client %s · pane %s · %s\n", $1, $2, substr($0, index($0,$3))}'
+            fi
+            # Snapshot of focused pane (captured by lzj-snapshot.timer)
+            local snap="$SNAP_DIR/${name}.txt"
+            if [ -f "$snap" ]; then
+                local age
+                age=$(( $(date +%s) - $(stat -c %Y "$snap") ))
+                echo
+                echo "── pane snapshot ($(fmt_age "$age") ago) ──"
+                tail -15 "$snap" | strip_ansi | sed 's/^/  /'
+            fi
+            ;;
+        exited)
+            echo "  exited; will be resurrected on attach"
+            ;;
+        systemd)
+            echo "  not running; ctrl-u to start, enter to attach (creates it)"
+            ;;
+    esac
+    return 0
+}
+
+# ── action helpers ─────────────────────────────────────────────────────────────
+prompt_new() {
+    local n
+    read -rp "new session name: " n
+    [ -z "$n" ] && return 0
+    if ! valid_session_name "$n"; then
+        echo "lzj: invalid session name (no spaces/newlines/control chars): $(printf %q "$n")" >&2
+        sleep 2
+        return 0
+    fi
+    "$ZELLIJ" attach -b "$n"
+    # To stderr so this human message is never mistaken for a session listing.
+    echo "created detached session: $n" >&2
+}
+
+confirm_kill() {
+    local n=$1
+    read -rp "kill session '$n'? [y/N] " a
+    [[ "$a" =~ ^[Yy]$ ]] || return 0
+    "$ZELLIJ" kill-session "$n" 2>&1 || true
+}
+
+confirm_delete() {
+    local n=$1
+    read -rp "delete (forget) session '$n'? [y/N] " a
+    [[ "$a" =~ ^[Yy]$ ]] || return 0
+    "$ZELLIJ" delete-session "$n" 2>&1 || true
+}
+
+systemd_up()   { systemctl --user enable --now "zellij@$1.service"; echo "enabled + started zellij@$1"; sleep 0.5; }
+systemd_down() { systemctl --user disable --now "zellij@$1.service"; echo "stopped + disabled zellij@$1"; sleep 0.5; }
+
+snapshot_now() {
+    systemctl --user start lzj-snapshot.service 2>/dev/null || "$HOME/.local/bin/lzj-snapshot"
+}
+
+# ── internal dispatch (called by fzf) ──────────────────────────────────────────
+case "${1:-}" in
+    --_list)       list_rows; exit 0 ;;
+    --_preview)    shift; preview_row "$*"; exit 0 ;;
+    --_new)        prompt_new; exit 0 ;;
+    --_kill)       confirm_kill "$2"; exit 0 ;;
+    --_delete)     confirm_delete "$2"; exit 0 ;;
+    --_up)         systemd_up "$2"; exit 0 ;;
+    --_down)       systemd_down "$2"; exit 0 ;;
+    --_snap)       snapshot_now; exit 0 ;;
+    --_layout)     shift; pick_layout_for "$1"; exit 0 ;;
+    @*)
+        # Remote dispatch: lzj @host [args...]
+        host=$(resolve_host "${1#@}")
+        shift
+        if [ $# -eq 0 ]; then
+            exec ssh -t "$host" 'bash -lc "lzj"'
+        else
+            # Pass through to remote lzj (handles ls/help/<name> uniformly)
+            exec ssh -t "$host" "bash -lc \"lzj $(printf '%q ' "$@")\""
+        fi
+        ;;
+    layouts)
+        list_layouts | cut -f3-
+        exit 0
+        ;;
+    ls|list)
+        echo "== zellij sessions =="
+        "$ZELLIJ" list-sessions 2>/dev/null || echo "(none)"
+        echo
+        echo "== systemd-managed (zellij@*) =="
+        systemctl --user list-units --type=service --all 'zellij@*' --no-legend --no-pager 2>/dev/null \
+            | awk '{print $1, $4}'
+        exit 0
+        ;;
+    -h|--help|help)
+        cat <<'EOF'
+lzj — "lazy zellij" fzf session manager
+
+Invocation:
+  lzj                   open the local picker
+  lzj <name>            attach to local session <name> (create if missing)
+  lzj <name> -l <lay>   attach to <name>; if missing, create with layout <lay>.
+                        if running, opens <lay> as a new tab (custom only).
+                        <lay> is a built-in name (default/compact/strider/...)
+                        or a layout stem from ~/.config/zellij/layouts/, or a path.
+  lzj layouts           list available layouts (built-ins + custom)
+  lzj ls                list local sessions + systemd units
+  lzj help              show this message
+  lzj @<host>           open the picker on a remote host
+  lzj @<host> <name>    attach to a remote session directly
+  lzj @<host> ls        list sessions on a remote host
+
+Host shortcuts: @prom @p @spark → prometheus, @mash @m @desk → monsta-mash.
+Anything else is passed to ssh verbatim (use your ~/.ssh/config aliases).
+
+Keys inside the picker:
+  enter         attach to selected session (creates if missing)
+  ctrl-n        prompt for a new session name (detached)
+  ctrl-d        kill the selected session (confirms)
+  ctrl-x        delete (forget) a dead session from the resurrection list
+  ctrl-l        pick a layout and apply it (new tab if running, fresh create otherwise)
+  ctrl-u        systemctl --user enable --now zellij@<name>   (autostart on boot)
+  alt-u         systemctl --user disable --now zellij@<name>
+  ctrl-p        force a snapshot now (otherwise updates every ~30s)
+  ctrl-r        reload the list
+  esc / ctrl-c  quit
+
+The preview pane shows, for each session:
+  · systemd unit status (if a zellij@<name>.service is registered)
+  · tab names and the command running in each pane (works for detached too)
+  · attached clients
+  · a periodic snapshot of the focused pane (captured by lzj-snapshot.timer)
+
+Run `lzj` with no args to launch.
+EOF
+        exit 0
+        ;;
+    "")
+        : # fall through to picker
+        ;;
+    *)
+        # Bare name: attach to a local session (create if missing).
+        # Optional: lzj <name> -l <layout>  /  --layout <layout>
+        name=$1; shift
+        if ! valid_session_name "$name"; then
+            echo "lzj: invalid session name (no spaces/newlines/control chars): $(printf %q "$name")" >&2
+            exit 2
+        fi
+        layout=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -l|--layout)
+                    [ $# -ge 2 ] || { echo "lzj: $1 needs an argument" >&2; exit 2; }
+                    layout=$2; shift 2 ;;
+                *) echo "lzj: unknown arg '$1'" >&2; exit 2 ;;
+            esac
+        done
+        if [ -n "$layout" ]; then
+            # Resolve a bare stem against the layout dir before passing through.
+            if [ ! -f "$layout" ] && [ -f "$LAYOUT_DIR/$layout.kdl" ]; then
+                layout="$LAYOUT_DIR/$layout.kdl"
+            fi
+            apply_layout "$name" "$layout"
+        else
+            exec "$ZELLIJ" attach -c "$name"
+        fi
+        ;;
+esac
+
+# ── main: launch picker ────────────────────────────────────────────────────────
+HEADER=$'enter:attach  ^n:new  ^l:layout  ^d:kill  ^x:delete  ^u:systemd-up  ⎇u:systemd-down  ^p:snap  ^r:reload'
+
+# fzf will print the selected row on stdout; we then attach to it.
+selected=$(
+    "$SELF" --_list | \
+    fzf \
+        --ansi \
+        --delimiter=$'\t' \
+        --with-nth=4 \
+        --header="$HEADER" \
+        --header-first \
+        --preview "$SELF --_preview {}" \
+        --preview-window='right:55%:wrap' \
+        --bind "ctrl-r:reload($SELF --_list)" \
+        --bind "ctrl-n:execute($SELF --_new)+reload($SELF --_list)" \
+        --bind "ctrl-d:execute($SELF --_kill {2})+reload($SELF --_list)" \
+        --bind "ctrl-x:execute($SELF --_delete {2})+reload($SELF --_list)" \
+        --bind "ctrl-u:execute($SELF --_up {2})+reload($SELF --_list)" \
+        --bind "alt-u:execute($SELF --_down {2})+reload($SELF --_list)" \
+        --bind "ctrl-p:execute-silent($SELF --_snap)+refresh-preview" \
+        --bind "ctrl-l:become($SELF --_layout {2})" \
+        --prompt='zellij › ' \
+    || true
+)
+
+[ -z "$selected" ] && exit 0
+name=$(printf '%s' "$selected" | cut -f2)
+[ -z "$name" ] && exit 0
+# Final guard: never create/attach a mangled name from a corrupt row.
+if ! valid_session_name "$name"; then
+    echo "lzj: refusing to attach to suspicious session name: $(printf %q "$name")" >&2
+    exit 1
+fi
+exec "$ZELLIJ" attach -c "$name"

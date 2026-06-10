@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# zj — zellij session helper
+#
+# Bare invocation attaches to "main" (creating it if missing). Subcommands:
+#   zj                    attach to "main", create if missing
+#   zj <name>             attach to <name>, create if missing
+#   zj ls                 list sessions (zellij + systemd-managed)
+#   zj new <name>         create a session in the background (no attach)
+#   zj up <name>          enable + start a systemd-managed session (autostart on boot)
+#   zj down <name>        stop + disable the systemd unit (session is killed)
+#   zj kill <name>        kill the session (does not disable systemd unit)
+#   zj rm <name>          delete an exited session from the resurrection list
+#   zj units              list zellij@* systemd units
+#   zj help               show this help
+
+set -euo pipefail
+
+ZELLIJ=${ZELLIJ_BIN:-$(command -v zellij 2>/dev/null || echo zellij)}
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
+
+cmd=${1:-attach}
+case "$cmd" in
+    -h|--help|help)
+        usage
+        ;;
+    ls|list)
+        echo "== zellij sessions =="
+        "$ZELLIJ" list-sessions 2>/dev/null || echo "(none)"
+        echo
+        echo "== systemd-managed (zellij@*) =="
+        systemctl --user list-units --type=service --all 'zellij@*' --no-legend --no-pager 2>/dev/null \
+            | awk '{print $1, $4}' \
+            || echo "(none)"
+        ;;
+    new)
+        name=${2:?usage: zj new <name>}
+        "$ZELLIJ" attach -b "$name"
+        echo "created detached session: $name"
+        ;;
+    up)
+        name=${2:?usage: zj up <name>}
+        systemctl --user enable --now "zellij@${name}.service"
+        echo "enabled + started zellij@${name}"
+        ;;
+    down)
+        name=${2:?usage: zj down <name>}
+        systemctl --user disable --now "zellij@${name}.service"
+        echo "stopped + disabled zellij@${name}"
+        ;;
+    kill)
+        name=${2:?usage: zj kill <name>}
+        "$ZELLIJ" kill-session "$name"
+        ;;
+    rm|delete)
+        name=${2:?usage: zj rm <name>}
+        "$ZELLIJ" delete-session "$name"
+        ;;
+    units)
+        systemctl --user list-units --type=service --all 'zellij@*' --no-pager
+        ;;
+    attach|a)
+        name=${2:-main}
+        exec "$ZELLIJ" attach -c "$name"
+        ;;
+    *)
+        # bare name: zj <name>  → attach (or create)
+        exec "$ZELLIJ" attach -c "$cmd"
+        ;;
+esac

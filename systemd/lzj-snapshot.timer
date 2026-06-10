@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic snapshots of active zellij sessions for lzj preview
+Requires=lzj-snapshot.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
