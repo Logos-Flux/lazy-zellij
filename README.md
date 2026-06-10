@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/social-preview.png" alt="lazy-zellij — a fast fzf session manager for zellij" width="100%">
+</p>
+
 # lazy-zellij
 
 A fast, `fzf`-based session manager for [zellij](https://zellij.dev) — plus a
