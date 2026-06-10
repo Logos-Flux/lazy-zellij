@@ -6,3 +6,6 @@
 .DS_Store
 *.swp
 *~
+
+# local session handoff notes (not for publication)
+HANDOFF.md
